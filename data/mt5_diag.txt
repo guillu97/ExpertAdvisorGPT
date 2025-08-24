@@ -1,0 +1,4 @@
+Serveur: ICMarketsSC-Demo
+Login: 52447035
+MT5_PATH: C:\Program Files\MetaTrader 5\terminal64.exe
+initialize()= False last_error= (-6, 'Terminal: Authorization failed')
