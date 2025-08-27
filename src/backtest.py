@@ -127,7 +127,7 @@ def simulate_trading(
     min_tp_atr_mult: float = 2.5,
     cooldown_bars_after_any_exit: int = 2,
     cooldown_bars_after_sl: int = 5,
-    
+
     # --- Filtres de volatilité ---
     vol_rel_min: float = 1.10,     # ratio std courte/longue (>=1.10 ~ marché actif)
     atr_ratio_min: float = 1.00,   # ATR / ATR_moy_100 (>=1.00 ~ ATR non anémié)
@@ -427,16 +427,17 @@ def simulate_trading(
         trades_today = day_trade_count.get(day_key, 0)
 
         # ---------- Filtre VOLATILITÉ (gating avant décision) ----------
-        # try:
-        #     vol_rel_now = float(df.iloc[idx_i]["vol_rel"])
-        #     atr_ratio_now = float(df.iloc[idx_i]["atr_ratio"])
-        # except Exception:
-        #     vol_rel_now, atr_ratio_now = float("nan"), float("nan")
-        # # si volatilité insuffisante → on saute cette barre
-        # if not (_is_finite(vol_rel_now) and _is_finite(atr_ratio_now)):
-        #     continue
-        # if vol_rel_now < vol_rel_min or atr_ratio_now < atr_ratio_min:
-        #     continue
+        try:
+            vol_rel_now = float(df.iloc[idx_i]["vol_rel"])
+            atr_ratio_now = float(df.iloc[idx_i]["atr_ratio"])
+        except Exception:
+            vol_rel_now, atr_ratio_now = float("nan"), float("nan")
+
+        # si volatilité insuffisante → on ne prend pas de décision à cette barre
+        if (not _is_finite(vol_rel_now)) or (not _is_finite(atr_ratio_now)):
+            continue
+        if (vol_rel_now < float(vol_rel_min)) or (atr_ratio_now < float(atr_ratio_min)):
+            continue
         # ---------------------------------------------------------------
 
         features = {
@@ -471,6 +472,10 @@ def simulate_trading(
 
             # hints
             "atr_min_hint": float(max(0.00025, atr_min_threshold)),
+
+            # seuils de vol transmis au modèle (pour décisions côté prompt)
+            "vol_rel_min": float(vol_rel_min),
+            "atr_ratio_min": float(atr_ratio_min),
 
             # info cadence (optionnel mais utile pour le prompt/debug)
             "decision_stride": int(decision_stride) if decision_stride else 1,
