@@ -180,7 +180,7 @@ def simulate_trading(
     # -------------------------------------------------------------------
 
     code = timeframe_to_mt5(timeframe)
-    rates = client.fetch_ohlcv(symbol, code, start, end)
+    rates = client.fetch_ohlcv(symbol, timeframe, start, end)
     if rates.empty or len(rates) < min_bars:
         print(f"[BT] Pas de données suffisantes pour {symbol} ({len(rates)} barres)")
         return []

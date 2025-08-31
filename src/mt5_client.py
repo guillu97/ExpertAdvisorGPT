@@ -7,8 +7,12 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-import MetaTrader5 as mt5
+# sous windows
+#import MetaTrader5 as mt5
 
+# sous linux
+from pymt5linux import MetaTrader5
+mt5 = MetaTrader5(host="localhost", port=8001)
 
 @dataclass
 class OrderResult:
@@ -24,18 +28,46 @@ class MT5Client:
 		self.server = server
 		self.terminal_path = terminal_path
 		self._connected = False
+	
+	def _normalize_win_path(self, p: Optional[str]) -> Optional[str]:
+		if not p:
+			return None
+		# /opt/wineprefix/drive_c/... -> C:\...
+		if p.startswith("/opt/wineprefix/drive_c/"):
+			p = "C:\\" + p.split("/opt/wineprefix/drive_c/")[1]
+		# slashes -> backslashes
+		return p.replace("/", "\\")
 
 	@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
 	def connect(self) -> bool:
-		# Tentative 1: initialize avec identifiants
-		ok = mt5.initialize(path=self.terminal_path, login=self.login, password=self.password, server=self.server)
-		if not ok:
-			# Tentative 2: initialize simple, puis login
-			if not mt5.initialize(path=self.terminal_path):
-				raise RuntimeError(f"MT5 initialize a échoué: {mt5.last_error()}")
-			if self.login and self.password and self.server:
-				if not mt5.login(self.login, password=self.password, server=self.server):
-					raise RuntimeError(f"MT5 login a échoué: {mt5.last_error()}")
+		p = self._normalize_win_path(self.terminal_path)
+		candidates = []
+		# 1) chemin fourni (normalisé)
+		if p:
+			candidates.append(("provided", p))
+		# 2) chemin par défaut d'install MT5
+		candidates.append(("default", r"C:\Program Files\MetaTrader 5\terminal64.exe"))
+		# 3) sans path (s’appuie sur install/terminal déjà lancé)
+		candidates.append(("none", None))
+
+		last_err = None
+		for label, cand in candidates:
+			if cand:
+				ok = mt5.initialize(path=cand, login=self.login, password=self.password, server=self.server)
+			else:
+				ok = mt5.initialize(login=self.login, password=self.password, server=self.server)
+			if ok:
+				self._connected = True
+				return True
+			last_err = mt5.last_error()
+
+		# fallback: initialize simple puis login (si identifiants fournis)
+		if not mt5.initialize():
+			raise RuntimeError(f"MT5 initialize a échoué: {last_err or mt5.last_error()}")
+		if self.login and self.password and self.server:
+			if not mt5.login(self.login, password=self.password, server=self.server):
+				raise RuntimeError(f"MT5 login a échoué: {mt5.last_error()}")
+
 		self._connected = True
 		return True
 
@@ -62,15 +94,44 @@ class MT5Client:
 		return mt5.orders_get()
 
 	def fetch_ohlcv(self, symbol: str, timeframe, start: datetime, end: datetime) -> pd.DataFrame:
+		# 1) convertir timeframe -> constante MT5
+		if isinstance(timeframe, str):
+			tf_map = {
+				"M1": mt5.TIMEFRAME_M1, "M2": mt5.TIMEFRAME_M2, "M3": mt5.TIMEFRAME_M3, "M4": mt5.TIMEFRAME_M4,
+				"M5": mt5.TIMEFRAME_M5, "M6": mt5.TIMEFRAME_M6, "M10": mt5.TIMEFRAME_M10, "M12": mt5.TIMEFRAME_M12,
+				"M15": mt5.TIMEFRAME_M15, "M20": mt5.TIMEFRAME_M20, "M30": mt5.TIMEFRAME_M30,
+				"H1": mt5.TIMEFRAME_H1, "H2": mt5.TIMEFRAME_H2, "H3": mt5.TIMEFRAME_H3, "H4": mt5.TIMEFRAME_H4,
+				"H6": mt5.TIMEFRAME_H6, "H8": mt5.TIMEFRAME_H8, "H12": mt5.TIMEFRAME_H12,
+				"D1": mt5.TIMEFRAME_D1, "W1": mt5.TIMEFRAME_W1, "MN1": mt5.TIMEFRAME_MN1,
+			}
+			tf = tf_map.get(timeframe.upper())
+		else:
+			tf = timeframe
+		if tf is None or not isinstance(tf, int):
+			raise ValueError(f"Timeframe invalide pour MetaTrader5: {timeframe!r}")
+
+		# 2) datetimes naïfs (UTC) pour compatibilité MT5
+		if start.tzinfo is not None:
+			start = start.astimezone(timezone.utc).replace(tzinfo=None)
+		if end.tzinfo is not None:
+			end = end.astimezone(timezone.utc).replace(tzinfo=None)
+
+		# 3) symbole dispo
 		if not self.ensure_symbol(symbol):
 			raise RuntimeError(f"Symbole introuvable: {symbol}")
-		rates = mt5.copy_rates_range(symbol, timeframe, start, end)
-		if rates is None or len(rates) == 0:
+
+		# 4) appel MT5
+		rates = mt5.copy_rates_range(symbol, tf, start, end)
+		if rates is None:
+			raise RuntimeError(f"copy_rates_range a renvoyé None: {mt5.last_error()}")
+		if len(rates) == 0:
 			return pd.DataFrame()
+
 		df = pd.DataFrame(rates)
 		df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
 		df.set_index("time", inplace=True)
 		return df[["open", "high", "low", "close", "tick_volume"]]
+
 
 	def place_market_order(self, symbol: str, action: str, volume: float, sl: Optional[float] = None, tp: Optional[float] = None, comment: str = "") -> OrderResult:
 		if action not in {"buy", "sell"}:
