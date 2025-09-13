@@ -1,3 +1,4 @@
+# src/backtest.py
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional, List, Tuple
@@ -8,13 +9,14 @@ import pandas as pd
 from .mt5_client import MT5Client
 from .config import timeframe_to_mt5
 from .gpt_strategy import gpt_decide, StrategyOutput
+from .econ_calendar import load_events_csv, build_high_impact_index, nearest_high_events
 
-import time  # <<< pour ETA
-import os  # <<< pour ENV
-
+import time
+import os
 from dotenv import load_dotenv
 
 load_dotenv()
+
 
 @dataclass
 class Trade:
@@ -25,9 +27,12 @@ class Trade:
     sl: Optional[float]
     tp: Optional[float]
     exit: Optional[float]
-    pnl: float = 0.0
+    pnl: float = 0.0              # PnL en devise du compte
     reason: str = ""
     exit_reason: str = ""
+    volume_lots: float = 0.0
+    equity_before: float = 0.0
+    equity_after: float = 0.0
 
 
 # ---------- Indicateurs utilitaires ----------
@@ -36,12 +41,14 @@ def _compute_atr_true_range(df: pd.DataFrame, n: int = 14) -> pd.Series:
     tr = pd.concat([(high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
     return tr.rolling(n).mean()
 
+
 def _sma(s: pd.Series, n: int) -> pd.Series:
     return s.rolling(n).mean()
 
+
 def _slope(series: pd.Series, lookback: int = 5) -> pd.Series:
-    # pente simple: différence moyenne par barre (approx)
     return (series - series.shift(lookback)) / max(1, lookback)
+
 
 def _rsi(close: pd.Series, n: int = 14) -> pd.Series:
     delta = close.diff()
@@ -50,11 +57,61 @@ def _rsi(close: pd.Series, n: int = 14) -> pd.Series:
     rs = ma_up / (ma_down.replace(0, float("inf")))
     return 100 - (100 / (1 + rs))
 
+
 def _vol_rel(close: pd.Series, n_short: int = 20, n_long: int = 100) -> pd.Series:
-    # volatilité relative: ratio des stds
     short = close.pct_change().rolling(n_short).std()
     long = close.pct_change().rolling(n_long).std()
     return (short / (long.replace(0, float("inf"))))
+
+
+# --- Wilder ADX (+DI/-DI) ---
+def _adx_components(df: pd.DataFrame, n: int = 14):
+    high = df["high"]; low = df["low"]; close = df["close"]
+    up_move = high.diff(); down_move = -low.diff()
+    plus_dm = ((up_move > down_move) & (up_move > 0)).astype(float) * up_move
+    minus_dm = ((down_move > up_move) & (down_move > 0)).astype(float) * down_move
+    tr1 = (high - low).abs(); tr2 = (high - close.shift()).abs(); tr3 = (low - close.shift()).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1/n, adjust=False).mean().replace(0, 1e-12)
+    plus_di = 100 * (plus_dm.ewm(alpha=1/n, adjust=False).mean() / atr)
+    minus_di = 100 * (minus_dm.ewm(alpha=1/n, adjust=False).mean() / atr)
+    dx = ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, 1e-12)) * 100
+    adx = dx.ewm(alpha=1/n, adjust=False).mean()
+    return plus_di, minus_di, adx
+
+
+# --- Supertrend ---
+def _supertrend(df: pd.DataFrame, atr: pd.Series, period: int = 10, mult: float = 3.0):
+    hl2 = (df["high"] + df["low"]) / 2.0
+    atr_s = atr if atr is not None else _compute_atr_true_range(df, n=period)
+    basic_ub = hl2 + mult * atr_s
+    basic_lb = hl2 - mult * atr_s
+
+    final_ub = basic_ub.copy(); final_lb = basic_lb.copy()
+    st = pd.Series(index=df.index, dtype=float)
+    dirn = pd.Series(index=df.index, dtype=int)
+
+    dirn.iloc[0] = 1
+    st.iloc[0] = final_lb.iloc[0]
+
+    for i in range(1, len(df)):
+        cprev = df["close"].iloc[i-1]
+        # Final bands with carry
+        final_ub.iloc[i] = basic_ub.iloc[i] if cprev <= final_ub.iloc[i-1] else min(basic_ub.iloc[i], final_ub.iloc[i-1])
+        final_lb.iloc[i] = basic_lb.iloc[i] if cprev >= final_lb.iloc[i-1] else max(basic_lb.iloc[i], final_lb.iloc[i-1])
+
+        # Direction switch
+        if df["close"].iloc[i] > final_ub.iloc[i-1]:
+            dirn.iloc[i] = 1
+        elif df["close"].iloc[i] < final_lb.iloc[i-1]:
+            dirn.iloc[i] = -1
+        else:
+            dirn.iloc[i] = dirn.iloc[i-1]
+
+        st.iloc[i] = final_lb.iloc[i] if dirn.iloc[i] == 1 else final_ub.iloc[i]
+
+    return st, dirn
+
 
 def _exit_price_long(row: pd.Series, sl: float, tp: float) -> Tuple[Optional[float], Optional[str]]:
     o, h, l = float(row["open"]), float(row["high"]), float(row["low"])
@@ -66,6 +123,7 @@ def _exit_price_long(row: pd.Series, sl: float, tp: float) -> Tuple[Optional[flo
     if hit_sl: return sl, "SL"
     return None, None
 
+
 def _exit_price_short(row: pd.Series, sl: float, tp: float) -> Tuple[Optional[float], Optional[str]]:
     o, h, l = float(row["open"]), float(row["high"]), float(row["low"])
     if o >= sl: return o, "SL(gap@open)"
@@ -76,8 +134,13 @@ def _exit_price_short(row: pd.Series, sl: float, tp: float) -> Tuple[Optional[fl
     if hit_tp: return tp, "TP"
     return None, None
 
+
 def _is_finite(x: float) -> bool:
-    return x is not None and not (math.isnan(x) or math.isinf(x))
+    try:
+        return (x is not None) and (not math.isnan(float(x))) and (not math.isinf(float(x)))
+    except Exception:
+        return False
+
 
 def _bars_per_day(timeframe: str) -> int:
     tf = timeframe.upper()
@@ -88,8 +151,8 @@ def _bars_per_day(timeframe: str) -> int:
     elif tf == "H1":  return 24
     elif tf == "H4":  return 6
     elif tf == "D1":  return 1
-    # fallback
-    return 288  # M5 par défaut
+    return 288
+
 
 def _tf_to_minutes(tf: str) -> int:
     tf = tf.upper().strip()
@@ -100,7 +163,6 @@ def _tf_to_minutes(tf: str) -> int:
     if tf == "H3": return 180
     if tf == "H4": return 240
     if tf == "D1": return 1440
-    # fallback raisonnable
     return 5
 
 
@@ -117,10 +179,11 @@ def simulate_trading(
     min_bars: int = 220,
     use_spread: bool = True,
     manual_spread_price: Optional[float] = None,
-    commission_per_trade: float = 0.0,
+    commission_per_trade: float = 0.0,            # backward compat (ignored if commission_per_lot set)
+    commission_per_lot: Optional[float] = None,   # NEW: per-lot commission
     log_level: int = logging.INFO,
 
-    # Robustesse
+    # Robustesse / filtres
     use_sma200_filter: bool = True,
     atr_min_threshold: float = 0.00025,
     min_sl_atr_mult: float = 1.5,
@@ -128,11 +191,11 @@ def simulate_trading(
     cooldown_bars_after_any_exit: int = 2,
     cooldown_bars_after_sl: int = 5,
 
-    # --- Filtres de volatilité ---
-    vol_rel_min: float = 1.10,     # ratio std courte/longue (>=1.10 ~ marché actif)
-    atr_ratio_min: float = 1.00,   # ATR / ATR_moy_100 (>=1.00 ~ ATR non anémié)
+    # Volatilité
+    vol_rel_min: float = 1.10,
+    atr_ratio_min: float = 1.00,
 
-    # Multi-timeframe
+    # MTF
     use_mtf: bool = True,
     mtf_symbols_same: bool = True,
     tf_m15: str = "M15",
@@ -145,19 +208,32 @@ def simulate_trading(
     loss_decay_bars: int = 100,
     day_reset: bool = False,
 
-    # Progress logs
+    # Décision cadence
     progress_log_every_pct: int = 5,
+
+    # --- Nouveaux paramètres Risk & Trend ---
+    starting_balance: float = 15000.0,
+    risk_pct_per_trade: float = 0.004,
+    max_daily_dd_pct: float = 0.02,
+    max_trades_per_day: int = 6,
+    adx_min: float = 20.0,
+    use_supertrend: bool = True,
+    supertrend_period: int = 10,
+    supertrend_mult: float = 3.0,
+
+    # --- News / calendrier ---
+    events_csv_path: Optional[str] = None,
+    no_trade_before_high_min: int = 15,
+    no_trade_after_high_min: int = 10,
 ) -> List[Trade]:
     logging.basicConfig(level=log_level, format="[BT] %(message)s")
     logger = logging.getLogger("backtest")
+    logger.info("SIM_VERSION=2025-09-01e")  # tag de version pour tracer les runs
 
-    # ------------ Nouveau: cadence de décision via ENV -----------------
-    # BT_DECISION_TF = "M15" par ex., ou "OFF" / non défini pour désactiver
-    # BT_DECISION_EVERY_BARS = "3" pour ne décider que toutes les N barres
+    # ------------ Cadence de décision via ENV -----------------
     decision_tf_env = (os.getenv("BT_DECISION_TF") or "").upper().strip()
     decision_every_bars_env = os.getenv("BT_DECISION_EVERY_BARS")
-
-    decision_stride: Optional[int] = None  # nombre de barres entre 2 décisions
+    decision_stride: Optional[int] = None
     base_minutes = _tf_to_minutes(timeframe)
 
     if decision_every_bars_env:
@@ -177,9 +253,21 @@ def simulate_trading(
         else:
             logger.warning(f"BT_DECISION_TF={decision_tf_env} incompatible avec TF base {timeframe} → cadence désactivée.")
 
-    # -------------------------------------------------------------------
+    # ------------- Confidence gating & sizing (ENV) -------------
+    try:
+        min_conf_buy = float(os.getenv("BT_MIN_CONF_BUY", "0.0"))
+    except Exception:
+        min_conf_buy = 0.0
+    try:
+        min_conf_sell = float(os.getenv("BT_MIN_CONF_SELL", "0.0"))
+    except Exception:
+        min_conf_sell = 0.0
+    conf_size_floor = max(0.0, min(1.0, float(os.getenv("BT_CONF_SIZE_FLOOR", "0.5"))))
+    conf_size_mode = (os.getenv("BT_CONF_SIZE_MODE", "linear") or "linear").lower()  # linear | square
 
-    code = timeframe_to_mt5(timeframe)
+    # ----------------------------------------------------------
+
+    _ = timeframe_to_mt5(timeframe)  # just to validate
     rates = client.fetch_ohlcv(symbol, timeframe, start, end)
     if rates.empty or len(rates) < min_bars:
         print(f"[BT] Pas de données suffisantes pour {symbol} ({len(rates)} barres)")
@@ -191,6 +279,21 @@ def simulate_trading(
     df["sma100"] = _sma(close, 100)
     df["sma200"] = _sma(close, 200)
     df["atr"] = _compute_atr_true_range(df, n=atr_len)
+
+    # ADX / DI
+    plus_di, minus_di, adx = _adx_components(df, n=14)
+    df["plus_di14"] = plus_di
+    df["minus_di14"] = minus_di
+    df["adx14"] = adx
+
+    # Supertrend
+    if use_supertrend:
+        st, dirn = _supertrend(df, df["atr"], period=supertrend_period, mult=supertrend_mult)
+        df["supertrend"] = st
+        df["supertrend_dir"] = dirn  # 1 up, -1 down
+    else:
+        df["supertrend"] = float("nan")
+        df["supertrend_dir"] = 0
 
     df["slope_sma20"] = _slope(df["sma20"], 5)
     df["slope_sma100"] = _slope(df["sma100"], 10)
@@ -214,7 +317,7 @@ def simulate_trading(
     hours = df.index.tz_convert("UTC").hour
     df["is_session_overlap"] = ((hours >= 12) & (hours < 16)).astype(int)
 
-    # --- MTF (pooled comme avant) ---
+    # --- MTF (optionnel) ---
     mtf = {}
     if use_mtf:
         try:
@@ -231,28 +334,60 @@ def simulate_trading(
                 r[f"sma20_{tf_name.lower()}"] = _sma(r["close"], 20)
                 mtf[tf_name] = r
 
+    # --- High-impact news (optionnel) ---
+    high_events = []
+    if events_csv_path:
+        try:
+            evts = load_events_csv(events_csv_path)
+            high_events = build_high_impact_index(evts)
+            logger.info(f"News: {len(high_events)} événements HIGH chargés depuis {events_csv_path}")
+        except Exception as e:
+            logger.warning(f"News: échec chargement {events_csv_path}: {e}")
+    _evt_ptr = 0  # curseur pour chercher le prochain événement (linéaire & rapide)
+
+    # --- Market micro / costs from MT5 ---
     spread_price = 0.0; stop_level_min = 0.0; freeze_level_min = 0.0
+    tick_value = None; tick_size = None; min_lot = 0.01; lot_step = 0.01; max_lot = 100.0
+    try:
+        import MetaTrader5 as mt5
+    except Exception:
+        from pymt5linux import MetaTrader5 as mt5
+        mt5 = mt5(host="localhost", port=8001)
+
     if use_spread:
         if manual_spread_price is not None and manual_spread_price > 0:
             spread_price = float(manual_spread_price)
         else:
             try:
-                import MetaTrader5 as mt5
                 si = mt5.symbol_info(symbol)
-                if si and si.point:
-                    if getattr(si, "spread", 0) and si.spread > 0:
+                if si:
+                    if getattr(si, "spread", 0) and si.spread > 0 and getattr(si, "point", 0):
                         spread_price = float(si.spread) * float(si.point)
                     stop_level_min = float(getattr(si, "stops_level", 0) or 0) * float(si.point)
                     freeze_level_min = float(getattr(si, "freeze_level", 0) or 0) * float(si.point)
             except Exception:
                 pass
 
+    try:
+        si = mt5.symbol_info(symbol)
+        if si:
+            tick_value = float(getattr(si, "trade_tick_value", 0.0) or 0.0) or None
+            tick_size = float(getattr(si, "trade_tick_size", 0.0) or 0.0) or None
+            min_lot = float(getattr(si, "volume_min", 0.01) or 0.01)
+            lot_step = float(getattr(si, "volume_step", 0.01) or 0.01)
+            max_lot = float(getattr(si, "volume_max", 100.0) or 100.0)
+    except Exception:
+        pass
+
+    # commissions
+    commission_per_lot_eff = commission_per_lot if commission_per_lot is not None else commission_per_trade
+
     logger.info(
-        "Paramètres: atr_len=%d, use_spread=%s, spread=%.8f, commission=%.8f, "
-        "use_sma200_filter=%s, atr_min=%.6f, minSL=%.2f*ATR, minTP=%.2f*ATR, cooldown_any=%d, cooldown_sl=%d",
-        atr_len, use_spread, spread_price, commission_per_trade,
-        use_sma200_filter, atr_min_threshold, min_sl_atr_mult, min_tp_atr_mult,
-        cooldown_bars_after_any_exit, cooldown_bars_after_sl
+        "Paramètres: atr_len=%d, use_spread=%s, spread=%.8f, commission_per_lot=%.4f, "
+        "use_sma200_filter=%s, atr_min=%.6f, minSL=%.2f*ATR, minTP=%.2f*ATR, cooldown_any=%d, cooldown_sl=%d, adx_min=%.1f, news_before=%d, news_after=%d",
+        atr_len, use_spread, spread_price, commission_per_lot_eff,
+        use_sma200_filter, atr_min_threshold, min_sl_atr_mult, min_tp_atr_mult, cooldown_bars_after_any_exit, cooldown_bars_after_sl, adx_min,
+        no_trade_before_high_min, no_trade_after_high_min
     )
 
     trades: List[Trade] = []
@@ -266,6 +401,10 @@ def simulate_trading(
     loss_pressure: float = 0.0
     last_event_bar_idx: Optional[int] = None
     last_day = None
+
+    # Equity & DD control
+    equity = float(starting_balance)
+    day_start_equity = equity
 
     window_days = 7
     window_bars = window_days * _bars_per_day(timeframe)
@@ -294,19 +433,18 @@ def simulate_trading(
                 last_logged_pct = pct
 
         row = df.iloc[idx_i]
-        day_key = df.index[idx_i + 1].date()
+        bar_time = df.index[idx_i + 1]
+        bar_time_utc = bar_time.tz_convert("UTC") if bar_time.tzinfo else bar_time.tz_localize("UTC")
+        day_key = bar_time.date()
         next_row = df.iloc[idx_i + 1]
         day_trade_count.setdefault(day_key, 0)
 
-        # resets prudence/decay (inchangé)
-        cur_day = day_key
-        if last_day is not None and cur_day != last_day and day_reset:
-            loss_streak = 0
-            win_streak = 0
-            loss_pressure *= 0.5
-            if loss_pressure < 1e-6:
-                loss_pressure = 0.0
-        last_day = cur_day
+        # Reset day start equity quand le jour change
+        if (last_day is not None) and (day_key != last_day):
+            day_start_equity = equity
+        last_day = day_key
+
+        # Decay loss pressure
         if last_event_bar_idx is not None and loss_pressure > 0 and loss_decay_bars > 0:
             bars_since = idx_i - last_event_bar_idx
             if bars_since >= loss_decay_bars:
@@ -317,83 +455,102 @@ def simulate_trading(
                         loss_pressure = 0.0
                     last_event_bar_idx += steps * loss_decay_bars
 
-        # vérifs indicateurs
+        # vérifs indicateurs basiques
         try:
             _ = float(row["sma20"]); _ = float(row["sma100"]); _ = float(row["sma200"])
             atr_now = float(row["atr"]); _ = float(row["close"])
         except Exception:
             continue
-        if not _is_finite(atr_now) or atr_now < atr_min_threshold:
-            # même si ATR faible on continue de gérer les EXIT
-            if in_position:
-                last_trade = trades[-1]
-                if last_trade.action == "buy":
-                    ex, rs = _exit_price_long(row, last_trade.sl, last_trade.tp)
-                    if ex is not None:
-                        adj = ex - (spread_price / 2.0) if use_spread else ex
-                        last_trade.exit = adj
-                        last_trade.pnl = (adj - last_trade.entry) - commission_per_trade
-                        last_trade.exit_reason = rs
-                        in_position = False; last_exit_bar_idx = idx_i; last_event_bar_idx = idx_i
-                        if last_trade.pnl < 0: loss_streak += 1; win_streak = 0; loss_pressure = min(loss_pressure + 1.0, float(loss_max))
-                        else: win_streak += 1; loss_streak = 0; loss_pressure = max(0.0, loss_pressure - loss_relief_win)
-                else:
-                    ex, rs = _exit_price_short(row, last_trade.sl, last_trade.tp)
-                    if ex is not None:
-                        adj = ex + (spread_price / 2.0) if use_spread else ex
-                        last_trade.exit = adj
-                        last_trade.pnl = (last_trade.entry - adj) - commission_per_trade
-                        last_trade.exit_reason = rs
-                        in_position = False; last_exit_bar_idx = idx_i; last_event_bar_idx = idx_i
-                        if last_trade.pnl < 0: loss_streak += 1; win_streak = 0; loss_pressure = min(loss_pressure + 1.0, float(loss_max))
-                        else: win_streak += 1; loss_streak = 0; loss_pressure = max(0.0, loss_pressure - loss_relief_win)
-            continue
 
-        # sorties si en position
+        # EXIT management first (si en position, on ne cherche QUE la sortie)
         if in_position:
             last_trade = trades[-1]
             if last_trade.action == "buy":
                 ex, rs = _exit_price_long(row, last_trade.sl, last_trade.tp)
                 if ex is not None:
                     adj = ex - (spread_price / 2.0) if use_spread else ex
+                    pnl_ticks = (adj - last_trade.entry) / (tick_size or 1.0)
+                    trade_pnl = pnl_ticks * (tick_value or 1.0) * last_trade.volume_lots - commission_per_lot_eff * last_trade.volume_lots
                     last_trade.exit = adj
-                    last_trade.pnl = (adj - last_trade.entry) - commission_per_trade
+                    last_trade.pnl = trade_pnl
                     last_trade.exit_reason = rs
+                    equity += trade_pnl
+                    last_trade.equity_after = equity
                     in_position = False; last_exit_bar_idx = idx_i; last_event_bar_idx = idx_i
                     last_exit_was_sl = rs.startswith("SL")
-                    if last_trade.pnl < 0: loss_streak += 1; win_streak = 0; loss_pressure = min(loss_pressure + 1.0, float(loss_max))
+                    if trade_pnl < 0: loss_streak += 1; win_streak = 0; loss_pressure = min(loss_pressure + 1.0, float(loss_max))
                     else: win_streak += 1; loss_streak = 0; loss_pressure = max(0.0, loss_pressure - loss_relief_win)
-                    logger.info(f"EXIT BUY {rs} @ {adj:.5f} pnl={last_trade.pnl:.5f} (loss_pressure={loss_pressure:.2f})")
+                    logger.info(f"EXIT BUY {rs} @ {adj:.5f} pnl={trade_pnl:.2f} eq={equity:.2f} (loss_pressure={loss_pressure:.2f})")
             else:
                 ex, rs = _exit_price_short(row, last_trade.sl, last_trade.tp)
                 if ex is not None:
                     adj = ex + (spread_price / 2.0) if use_spread else ex
+                    pnl_ticks = (last_trade.entry - adj) / (tick_size or 1.0)
+                    trade_pnl = pnl_ticks * (tick_value or 1.0) * last_trade.volume_lots - commission_per_lot_eff * last_trade.volume_lots
                     last_trade.exit = adj
-                    last_trade.pnl = (last_trade.entry - last_trade.exit) - commission_per_trade
+                    last_trade.pnl = trade_pnl
                     last_trade.exit_reason = rs
+                    equity += trade_pnl
+                    last_trade.equity_after = equity
                     in_position = False; last_exit_bar_idx = idx_i; last_event_bar_idx = idx_i
                     last_exit_was_sl = rs.startswith("SL")
-                    if last_trade.pnl < 0: loss_streak += 1; win_streak = 0; loss_pressure = min(loss_pressure + 1.0, float(loss_max))
+                    if trade_pnl < 0: loss_streak += 1; win_streak = 0; loss_pressure = min(loss_pressure + 1.0, float(loss_max))
                     else: win_streak += 1; loss_streak = 0; loss_pressure = max(0.0, loss_pressure - loss_relief_win)
-                    logger.info(f"EXIT SELL {rs} @ {adj:.5f} pnl={last_trade.pnl:.5f} (loss_pressure={loss_pressure:.2f})")
+                    logger.info(f"EXIT SELL {rs} @ {adj:.5f} pnl={trade_pnl:.2f} eq={equity:.2f} (loss_pressure={loss_pressure:.2f})")
 
+            # Toujours continuer à la barre suivante si on est encore en position
             if in_position:
-                continue  # pas de nouveau trade si encore en position
+                continue
 
-        # cooldown
+        # À partir d'ici, on est FLAT (pas de nouvelle entrée si ATR très faible)
+        if (not _is_finite(atr_now)) or (atr_now < atr_min_threshold):
+            continue
+
+        # cooldown entre trades après une sortie
         if last_exit_bar_idx is not None:
             bars_since_exit = idx_i - last_exit_bar_idx
             needed = cooldown_bars_after_sl if last_exit_was_sl else cooldown_bars_after_any_exit
             if bars_since_exit < needed:
                 continue
 
-        # -------- Gating de décision par cadence (ENV) ----------
+        # Garde-fou journalier (hard cap si besoin)
+        trades_today = day_trade_count.get(day_key, 0)
+        if trades_today >= max_trades_per_day:
+            continue
+
+        # cadence (si configurée)
         if decision_stride is not None:
-            # On décide uniquement à la FIN d’un bloc (ex: chaque 3 barres si M15 sur M5)
             bar_index = (idx_i - loop_start + 1)
             if bar_index % decision_stride != 0:
                 continue
+
+        # ----------------- NEWS NO-TRADE WINDOW -----------------
+        minutes_to_next_high = None
+        minutes_since_last_high = None
+        next_high_name = ""
+        event_window_active = False
+        if high_events:
+            m_to, m_since, next_evt, _evt_ptr = nearest_high_events(bar_time_utc.to_pydatetime(), high_events, _evt_ptr)
+            minutes_to_next_high = m_to
+            minutes_since_last_high = m_since
+            if next_evt:
+                next_high_name = next_evt.name
+            if (m_to is not None and m_to <= int(no_trade_before_high_min)) or (m_since is not None and m_since <= int(no_trade_after_high_min)):
+                event_window_active = True
         # --------------------------------------------------------
+
+        # Quality gating
+        vol_rel_now = float(df.iloc[idx_i]["vol_rel"]) if _is_finite(df.iloc[idx_i]["vol_rel"]) else float("nan")
+        atr_ratio_now = float(df.iloc[idx_i]["atr_ratio"]) if _is_finite(df.iloc[idx_i]["atr_ratio"]) else float("nan")
+        if (not _is_finite(vol_rel_now)) or (not _is_finite(atr_ratio_now)):
+            continue
+        if (vol_rel_now < float(vol_rel_min)) or (atr_ratio_now < float(atr_ratio_min)):
+            continue
+
+        # Kill-switch quotidien (pas de nouvelles entrées)
+        kill_switch = (equity - day_start_equity) / max(1e-9, day_start_equity) <= -max_daily_dd_pct
+        if kill_switch:
+            continue
 
         # Contexte / features
         start_idx = max(0, idx_i - window_bars)
@@ -402,43 +559,50 @@ def simulate_trading(
             continue
 
         sma20 = float(row["sma20"]); sma100 = float(row["sma100"]); sma200 = float(row["sma200"])
-        atr_now = float(row["atr"])
+        adx_now = float(row["adx14"]) if _is_finite(row["adx14"]) else 0.0
+        st_dir = int(row["supertrend_dir"]) if use_supertrend else 0
 
-        trend_buy_ok = sma20 > sma100
-        trend_sell_ok = sma20 < sma100
+        trend_buy_ok = (sma20 > sma100)
+        trend_sell_ok = (sma20 < sma100)
         if use_sma200_filter:
             trend_buy_ok = trend_buy_ok and (sma100 > sma200) and (sma20 > sma200)
             trend_sell_ok = trend_sell_ok and (sma100 < sma200) and (sma20 < sma200)
+        if use_supertrend:
+            trend_buy_ok = trend_buy_ok and (st_dir == 1)
+            trend_sell_ok = trend_sell_ok and (st_dir == -1)
+        # ADX filter
+        trend_buy_ok = trend_buy_ok and (adx_now >= adx_min)
+        trend_sell_ok = trend_sell_ok and (adx_now >= adx_min)
 
-        mtf_features = {}
-        try:
-            if use_mtf and mtf:
-                for tf_name, r in mtf.items():
-                    r_slice = r.loc[:row.name]
-                    if not r_slice.empty:
-                        last_row = r_slice.iloc[-1]
-                        mtf_features[f"sma20_{tf_name.lower()}"] = float(last_row.get(f"sma20_{tf_name.lower()}", float("nan")))
-                        mtf_features[f"close_{tf_name.lower()}"] = float(last_row.get("close", float("nan")))
-        except Exception:
-            pass
-
+        # PnL récent
         trades_last_n = trades[-10:]
         last_n_pnl = sum(t.pnl for t in trades_last_n if t.exit is not None)
-        trades_today = day_trade_count.get(day_key, 0)
 
-        # ---------- Filtre VOLATILITÉ (gating avant décision) ----------
-        try:
-            vol_rel_now = float(df.iloc[idx_i]["vol_rel"])
-            atr_ratio_now = float(df.iloc[idx_i]["atr_ratio"])
-        except Exception:
-            vol_rel_now, atr_ratio_now = float("nan"), float("nan")
+        # ----- HTF bias (M15/H1/H4) -----
+        htf_bias = 0.0
+        if mtf:
+            def _bias_from(mdf):
+                # dernier point <= bar_time
+                try:
+                    j = mdf.index.get_indexer([bar_time], method="pad")[0]
+                    if j < 0:
+                        return 0.0
+                except Exception:
+                    j = len(mdf) - 1
+                c = float(mdf["close"].iloc[j])
+                s = float(mdf.filter(like="sma20").iloc[j, 0])
+                return 1.0 if (c > s) else (-1.0 if c < s else 0.0)
+            try:
+                htf_bias = 0.0
+                if "M15" in mtf: htf_bias += 0.5 * _bias_from(mtf["M15"])
+                if "H1"  in mtf: htf_bias += 0.8 * _bias_from(mtf["H1"])
+                if "H4"  in mtf: htf_bias += 1.2 * _bias_from(mtf["H4"])
+            except Exception:
+                htf_bias = 0.0
 
-        # si volatilité insuffisante → on ne prend pas de décision à cette barre
-        if (not _is_finite(vol_rel_now)) or (not _is_finite(atr_ratio_now)):
-            continue
-        if (vol_rel_now < float(vol_rel_min)) or (atr_ratio_now < float(atr_ratio_min)):
-            continue
-        # ---------------------------------------------------------------
+        # Poids de session & pénalité spread
+        session_weight = 1.05 if str(df.iloc[idx_i]["session"]) in ("london_open", "newyork") else 0.85
+        spread_penalty = (spread_price / max(atr_now, 1e-12)) if spread_price and atr_now else 0.0
 
         features = {
             "close": float(row["close"]),
@@ -457,7 +621,14 @@ def simulate_trading(
             "spread_price": float(spread_price),
             "stop_level_min": float(stop_level_min),
             "freeze_level_min": float(freeze_level_min),
-
+            # ADX/Supertrend
+            "adx14": adx_now, "plusDI": float(df.iloc[idx_i]["plus_di14"]), "minusDI": float(df.iloc[idx_i]["minus_di14"]),
+            "supertrend_dir": ("up" if st_dir == 1 else ("down" if st_dir == -1 else "flat")),
+            "adx_min": float(adx_min),
+            # htf & session
+            "htf_bias": float(htf_bias),
+            "session_weight": float(session_weight),
+            "spread_penalty": float(spread_penalty),
             # comportement
             "loss_streak": int(loss_streak),
             "win_streak": int(win_streak),
@@ -465,25 +636,42 @@ def simulate_trading(
             "trades_in_day": int(trades_today),
             "cooldown_active": False,
             "loss_pressure": float(round(loss_pressure, 3)),
-
+            "kill_switch_active": False,
+            # news
+            "event_window_active": bool(event_window_active),
+            "minutes_to_next_high": int(minutes_to_next_high) if minutes_to_next_high is not None else None,
+            "minutes_since_last_high": int(minutes_since_last_high) if minutes_since_last_high is not None else None,
+            "no_trade_before_high_min": int(no_trade_before_high_min),
+            "no_trade_after_high_min": int(no_trade_after_high_min),
+            "next_high_event": next_high_name or "",
             # filtres impératifs
             "trend_buy_ok": bool(trend_buy_ok),
             "trend_sell_ok": bool(trend_sell_ok),
-
-            # hints
-            "atr_min_hint": float(max(0.00025, atr_min_threshold)),
-
-            # seuils de vol transmis au modèle (pour décisions côté prompt)
+            # seuils de vol transmis au modèle
             "vol_rel_min": float(vol_rel_min),
             "atr_ratio_min": float(atr_ratio_min),
-
-            # info cadence (optionnel mais utile pour le prompt/debug)
+            # hints SL/TP
+            "sl_mult_hint_range": [1.7, 2.3],
+            "tp_rr_hint_range": [2.0, 2.8],
+            # info cadence
             "decision_stride": int(decision_stride) if decision_stride else 1,
             "decision_tf_env": decision_tf_env or "",
         }
-        features.update(mtf_features)
+
+        # Sécurité : si pour une raison X on est revenu en position, on n'entre pas
+        if in_position:
+            logger.error("Invariant breach: in_position=True avant décision — skip.")
+            continue
 
         decision: StrategyOutput = gpt_decide(features, api_key=api_key, model=model)
+
+        # Confidence gating
+        conf = float(getattr(decision, "confidence", 0.5) or 0.5)
+        if decision.decision == "buy" and conf < min_conf_buy:
+            continue
+        if decision.decision == "sell" and conf < min_conf_sell:
+            continue
+
         if decision.decision not in ("buy", "sell"):
             continue
         if decision.decision == "buy" and not trend_buy_ok:
@@ -491,19 +679,21 @@ def simulate_trading(
         if decision.decision == "sell" and not trend_sell_ok:
             continue
 
-        # Entrée au prochain open (du premier M5 du bloc suivant si stride > 1)
+        # Entrée au prochain open
         raw_entry = float(next_row["open"])
         sl_pts = max(0.0, float(decision.sl_points))
         tp_pts = max(0.0, float(decision.tp_points))
-        sl_min = max(sl_pts, min_sl_atr_mult * atr_now)
+        sl_min = max(sl_pts, min_sl_atr_mult * atr_now, 3 * (spread_price or 0.0), float(stop_level_min))
         tp_min = max(tp_pts, min_tp_atr_mult * atr_now)
 
         if decision.decision == "buy":
             entry = raw_entry + (spread_price / 2.0) if use_spread else raw_entry
             sl = entry - sl_min; tp = entry + tp_min
+            sl_dist = entry - sl
         else:
             entry = raw_entry - (spread_price / 2.0) if use_spread else raw_entry
             sl = entry + sl_min; tp = entry - tp_min
+            sl_dist = sl - entry
 
         if not (_is_finite(sl) and _is_finite(tp) and _is_finite(entry)):
             continue
@@ -512,37 +702,77 @@ def simulate_trading(
         if decision.decision == "sell" and (sl <= entry or tp >= entry):
             continue
 
-        trades.append(Trade(
+        # --- Confidence-based sizing ---
+        if conf_size_mode == "square":
+            size_factor = max(conf_size_floor, min(1.0, conf * conf))
+        else:
+            size_factor = max(conf_size_floor, min(1.0, conf))
+
+        # --- Risk-based position sizing ---
+        if not tick_value or not tick_size or tick_size <= 0:
+            vol_lots = 1.0 * size_factor
+        else:
+            risk_amt = equity * float(max(0.0, risk_pct_per_trade)) * size_factor
+            ticks_to_sl = max(1.0, sl_dist / tick_size)
+            cost_per_lot_at_sl = ticks_to_sl * tick_value
+            if cost_per_lot_at_sl <= 0:
+                continue
+            vol_lots = risk_amt / cost_per_lot_at_sl
+            # align to broker constraints
+            steps = max(1, int(vol_lots / (lot_step or 0.01)))
+            vol_lots = steps * (lot_step or 0.01)
+            vol_lots = max(min_lot, min(max_lot, vol_lots))
+            if vol_lots < (min_lot - 1e-9):
+                continue
+
+        # Double check invariant juste avant append
+        if in_position:
+            logger.error("Invariant breach: tentative d'entrée alors qu'on est déjà en position — skip.")
+            continue
+
+        # Enrichir la reason avec la confiance & sizing
+        reason_txt = decision.reason or ""
+        reason_txt = (reason_txt + f"; conf={conf:.2f}; size×={size_factor:.2f}").strip()
+
+        # Enregistrer le trade (equity_before)
+        trade = Trade(
             time=df.index[idx_i + 1].to_pydatetime(),
             symbol=symbol,
             action=decision.decision,
-            entry=entry, sl=sl, tp=tp, exit=None, reason=decision.reason,
-        ))
+            entry=entry, sl=sl, tp=tp, exit=None, reason=reason_txt,
+            volume_lots=float(round(vol_lots, 4)),
+            equity_before=float(round(equity, 2)),
+            equity_after=float(round(equity, 2)),
+        )
+        trades.append(trade)
         in_position = True
         day_trade_count[day_key] += 1
 
-        logging.info(
-            f"ENTER {decision.decision.upper()} @ {entry:.5f} sl={sl:.5f} tp={tp:.5f} "
-            f"(raw_open={raw_entry:.5f}, ATR={atr_now:.6f}, loss_pressure={loss_pressure:.2f}, stride={decision_stride or 1}) "
-            f"reason={decision.reason[:100]}"
+        logger.info(
+            f"ENTER {decision.decision.upper()} @ {entry:.5f} sl={sl:.5f} tp={tp:.5f} vol={vol_lots:.2f} "
+            f"(ATR={atr_now:.6f}, loss_pressure={loss_pressure:.2f}, conf={conf:.2f}, size×={size_factor:.2f}, stride={decision_stride or 1}) "
+            f"reason={reason_txt[:140]} | eq={equity:.2f}"
         )
 
-    if in_position and len(trades) > 0:
-        last = df.iloc[-1]
-        last_trade = trades[-1]
-        eod_exit = float(last["close"])
-        if last_trade.action == "buy":
-            adj_exit = eod_exit - (spread_price / 2.0) if use_spread else eod_exit
-            last_trade.exit = adj_exit
-            last_trade.pnl = (last_trade.exit - last_trade.entry) - commission_per_trade
-            last_trade.exit_reason = "EOD"
-            logging.info(f"EXIT BUY EOD @ {adj_exit:.5f} pnl={last_trade.pnl:.5f}")
-        else:
-            adj_exit = eod_exit + (spread_price / 2.0) if use_spread else eod_exit
-            last_trade.exit = adj_exit
-            last_trade.pnl = (last_trade.entry - last_trade.exit) - commission_per_trade
-            last_trade.exit_reason = "EOD"
-            logging.info(f"EXIT SELL EOD @ {adj_exit:.5f} pnl={last_trade.pnl:.5f}")
+    # ---------- EOD: mass-close de TOUT trade encore ouvert ----------
+    if len(trades) > 0:
+        eod_price = float(df.iloc[-1]["close"])
+        for t in reversed(trades):
+            if t.exit is not None:
+                break
+            if t.action == "buy":
+                adj = eod_price - (spread_price / 2.0) if use_spread else eod_price
+                pnl_ticks = (adj - t.entry) / (tick_size or 1.0)
+            else:
+                adj = eod_price + (spread_price / 2.0) if use_spread else eod_price
+                pnl_ticks = (t.entry - adj) / (tick_size or 1.0)
+            trade_pnl = pnl_ticks * (tick_value or 1.0) * (t.volume_lots or 1.0) - commission_per_lot_eff * (t.volume_lots or 1.0)
+            t.exit = adj
+            t.pnl = trade_pnl
+            t.exit_reason = "EOD(mass-close)"
+            equity += trade_pnl
+            t.equity_after = equity
+            logging.info(f"EXIT {t.action.upper()} EOD(mass-close) @ {adj:.5f} pnl={trade_pnl:.2f} eq={equity:.2f}")
 
-    logging.info(f"Fin simulation {symbol}: trades={len(trades)}")
+    logging.info(f"Fin simulation {symbol}: trades={len(trades)} | equity_final={equity:.2f}")
     return trades

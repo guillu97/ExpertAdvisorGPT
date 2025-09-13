@@ -1,24 +1,32 @@
-from __future__ import annotations
+# src/mt5_client.py (entête)
 
+from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, List
-from datetime import datetime, timedelta, timezone
-
+from datetime import datetime, timezone
+import os
 import pandas as pd
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-# sous windows
-#import MetaTrader5 as mt5
-
-# sous linux
-from pymt5linux import MetaTrader5
-mt5 = MetaTrader5(host="localhost", port=8001)
+# ---- Import MT5: natif Windows d'abord, fallback pymt5linux ----
+try:
+    import MetaTrader5 as mt5
+    _MT5_BACKEND = "native"
+    _PYMT5 = None
+except Exception:
+    from pymt5linux import MetaTrader5 as _PyMT5
+    _PYMT5 = _PyMT5(
+        host=os.getenv("MT5_HOST", "localhost"),
+        port=int(os.getenv("MT5_PORT", "8001"))
+    )
+    mt5 = _PYMT5  # compat shim
+    _MT5_BACKEND = "pymt5linux"
 
 @dataclass
 class OrderResult:
-	order_id: Optional[int]
-	success: bool
-	message: str
+    order_id: Optional[int]
+    success: bool
+    message: str
 
 
 class MT5Client:
